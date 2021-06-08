@@ -24,7 +24,7 @@ const (
 	RoundStepPrevoteWait   = RoundStepType(0x05) // Did receive any +2/3 prevotes, start timeout
 	RoundStepPrecommit     = RoundStepType(0x06) // Did precommit, gossip precommits
 	RoundStepPrecommitWait = RoundStepType(0x07) // Did receive any +2/3 precommits, start timeout
-	RoundStepCommit        = RoundStepType(0x08) // Entered commit state machine
+	RoundStepApplyCommit   = RoundStepType(0x08) // Entered commit state machine
 	// NOTE: RoundStepNewHeight acts as RoundStepCommitWait.
 
 	// NOTE: Update IsValid method if you change this!
@@ -52,8 +52,8 @@ func (rs RoundStepType) String() string {
 		return "RoundStepPrecommit"
 	case RoundStepPrecommitWait:
 		return "RoundStepPrecommitWait"
-	case RoundStepCommit:
-		return "RoundStepCommit"
+	case RoundStepApplyCommit:
+		return "RoundStepApplyCommit"
 	default:
 		return "RoundStepUnknown" // Cannot panic.
 	}
@@ -88,7 +88,7 @@ type RoundState struct {
 	ValidBlockParts           *types.PartSet      `json:"valid_block_parts"`
 	Votes                     *HeightVoteSet      `json:"votes"`
 	CommitRound               int32               `json:"commit_round"` //
-	LastCommit                *types.VoteSet      `json:"last_commit"`  // Last precommits at Height-1
+	LastCommit                *types.Commit       `json:"last_commit"`
 	LastValidators            *types.ValidatorSet `json:"last_validators"`
 	TriggeredTimeoutPrecommit bool                `json:"triggered_timeout_precommit"`
 }
@@ -111,8 +111,8 @@ func (rs *RoundState) RoundStateSimple() RoundStateSimple {
 		panic(err)
 	}
 
-	addr := rs.Validators.GetProposer().Address
-	idx, _ := rs.Validators.GetByAddress(addr)
+	proTxHash := rs.Validators.GetProposer().ProTxHash
+	idx, _ := rs.Validators.GetByProTxHash(proTxHash)
 
 	return RoundStateSimple{
 		HeightRoundStep:   fmt.Sprintf("%d/%d/%d", rs.Height, rs.Round, rs.Step),
@@ -122,24 +122,24 @@ func (rs *RoundState) RoundStateSimple() RoundStateSimple {
 		ValidBlockHash:    rs.ValidBlock.Hash(),
 		Votes:             votesJSON,
 		Proposer: types.ValidatorInfo{
-			Address: addr,
-			Index:   idx,
+			ProTxHash: proTxHash,
+			Index:     idx,
 		},
 	}
 }
 
 // NewRoundEvent returns the RoundState with proposer information as an event.
 func (rs *RoundState) NewRoundEvent() types.EventDataNewRound {
-	addr := rs.Validators.GetProposer().Address
-	idx, _ := rs.Validators.GetByAddress(addr)
+	proTxHash := rs.Validators.GetProposer().ProTxHash
+	idx, _ := rs.Validators.GetByProTxHash(proTxHash)
 
 	return types.EventDataNewRound{
 		Height: rs.Height,
 		Round:  rs.Round,
 		Step:   rs.Step.String(),
 		Proposer: types.ValidatorInfo{
-			Address: addr,
-			Index:   idx,
+			ProTxHash: proTxHash,
+			Index:     idx,
 		},
 	}
 }
@@ -203,7 +203,7 @@ func (rs *RoundState) StringIndented(indent string) string {
 		indent, rs.ValidRound,
 		indent, rs.ValidBlockParts.StringShort(), rs.ValidBlock.StringShort(),
 		indent, rs.Votes.StringIndented(indent+"  "),
-		indent, rs.LastCommit.StringShort(),
+		indent, rs.LastCommit.StringIndented(indent+"  "),
 		indent, rs.LastValidators.StringIndented(indent+"  "),
 		indent)
 }

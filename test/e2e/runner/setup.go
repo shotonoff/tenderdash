@@ -4,6 +4,7 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,10 +18,12 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/tendermint/tendermint/crypto"
+	"github.com/tendermint/tendermint/crypto/bls12381"
+
 	"github.com/BurntSushi/toml"
 
 	"github.com/tendermint/tendermint/config"
-	"github.com/tendermint/tendermint/crypto/ed25519"
 	"github.com/tendermint/tendermint/p2p"
 	"github.com/tendermint/tendermint/privval"
 	e2e "github.com/tendermint/tendermint/test/e2e/pkg"
@@ -64,21 +67,21 @@ func Setup(testnet *e2e.Testnet) error {
 
 	for _, node := range testnet.Nodes {
 		nodeDir := filepath.Join(testnet.Dir, node.Name)
+
 		dirs := []string{
 			filepath.Join(nodeDir, "config"),
 			filepath.Join(nodeDir, "data"),
 			filepath.Join(nodeDir, "data", "app"),
 		}
 		for _, dir := range dirs {
+			// light clients don't need an app directory
+			if node.Mode == e2e.ModeLight && strings.Contains(dir, "app") {
+				continue
+			}
 			err := os.MkdirAll(dir, 0755)
 			if err != nil {
 				return err
 			}
-		}
-
-		err = genesis.SaveAs(filepath.Join(nodeDir, "config", "genesis.json"))
-		if err != nil {
-			return err
 		}
 
 		cfg, err := MakeConfig(node)
@@ -96,19 +99,33 @@ func Setup(testnet *e2e.Testnet) error {
 			return err
 		}
 
+		if node.Mode == e2e.ModeLight {
+			// stop early if a light client
+			continue
+		}
+
+		err = genesis.SaveAs(filepath.Join(nodeDir, "config", "genesis.json"))
+		if err != nil {
+			return err
+		}
+
 		err = (&p2p.NodeKey{PrivKey: node.NodeKey}).SaveAs(filepath.Join(nodeDir, "config", "node_key.json"))
 		if err != nil {
 			return err
 		}
 
-		(privval.NewFilePV(node.PrivvalKey,
-			filepath.Join(nodeDir, PrivvalKeyFile),
-			filepath.Join(nodeDir, PrivvalStateFile),
-		)).Save()
-
+		if node.Mode == e2e.ModeValidator {
+			if len(node.ProTxHash) != crypto.ProTxHashSize {
+				return fmt.Errorf("node proTxHash should be 32 bytes")
+			}
+			(privval.NewFilePV(node.PrivvalKey, node.ProTxHash.Bytes(), node.NextPrivvalKeys, node.NextPrivvalHeights,
+				filepath.Join(nodeDir, PrivvalKeyFile),
+				filepath.Join(nodeDir, PrivvalStateFile),
+			)).Save()
+		}
 		// Set up a dummy validator. Tenderdash requires a file PV even when not used, so we
 		// give it a dummy such that it will fail if it actually tries to use it.
-		(privval.NewFilePV(ed25519.GenPrivKey(),
+		(privval.NewFilePV(bls12381.GenPrivKey(), crypto.RandProTxHash(), nil, nil,
 			filepath.Join(nodeDir, PrivvalDummyKeyFile),
 			filepath.Join(nodeDir, PrivvalDummyStateFile),
 		)).Save()
@@ -165,6 +182,7 @@ services:
     ports:
     - 26656
     - {{ if .ProxyPort }}{{ .ProxyPort }}:{{ end }}26657
+    - 6060
     volumes:
     - ./{{ .Name }}:/tenderdash
     networks:
@@ -186,17 +204,20 @@ services:
 // MakeGenesis generates a genesis document.
 func MakeGenesis(testnet *e2e.Testnet) (types.GenesisDoc, error) {
 	genesis := types.GenesisDoc{
-		GenesisTime:     time.Now(),
-		ChainID:         testnet.Name,
-		ConsensusParams: types.DefaultConsensusParams(),
-		InitialHeight:   testnet.InitialHeight,
+		GenesisTime:        time.Now(),
+		ChainID:            testnet.Name,
+		ConsensusParams:    types.DefaultConsensusParams(),
+		InitialHeight:      testnet.InitialHeight,
+		ThresholdPublicKey: testnet.ThresholdPublicKey,
+		QuorumHash:         testnet.QuorumHash,
 	}
-	for validator, power := range testnet.Validators {
+	for validator, pubkey := range testnet.Validators {
 		genesis.Validators = append(genesis.Validators, types.GenesisValidator{
-			Name:    validator.Name,
-			Address: validator.PrivvalKey.PubKey().Address(),
-			PubKey:  validator.PrivvalKey.PubKey(),
-			Power:   power,
+			Name:      validator.Name,
+			Address:   pubkey.Address(),
+			PubKey:    pubkey,
+			ProTxHash: validator.ProTxHash,
+			Power:     types.DefaultDashVotingPower,
 		})
 	}
 	// The validator set will be sorted internally by Tenderdash ranked by power,
@@ -220,6 +241,7 @@ func MakeConfig(node *e2e.Node) (*config.Config, error) {
 	cfg.Moniker = node.Name
 	cfg.ProxyApp = AppAddressTCP
 	cfg.RPC.ListenAddress = "tcp://0.0.0.0:26657"
+	cfg.RPC.PprofListenAddress = ":6060"
 	cfg.P2P.ExternalAddress = fmt.Sprintf("tcp://%v", node.AddressP2P(false))
 	cfg.P2P.AddrBookStrict = false
 	cfg.DBBackend = node.Database
@@ -264,7 +286,7 @@ func MakeConfig(node *e2e.Node) (*config.Config, error) {
 	case e2e.ModeSeed:
 		cfg.P2P.SeedMode = true
 		cfg.P2P.PexReactor = true
-	case e2e.ModeFull:
+	case e2e.ModeFull, e2e.ModeLight:
 		// Don't need to do anything, since we're using a dummy privval key by default.
 	default:
 		return nil, fmt.Errorf("unexpected mode %q", node.Mode)
@@ -313,6 +335,8 @@ func MakeAppConfig(node *e2e.Node) ([]byte, error) {
 		"chain_id":          node.Testnet.Name,
 		"dir":               "data/app",
 		"listen":            AppAddressUNIX,
+		"mode":              node.Mode,
+		"proxy_port":        node.ProxyPort,
 		"protocol":          "socket",
 		"persist_interval":  node.PersistInterval,
 		"snapshot_interval": node.SnapshotInterval,
@@ -356,15 +380,36 @@ func MakeAppConfig(node *e2e.Node) ([]byte, error) {
 	cfg["misbehaviors"] = misbehaviors
 
 	if len(node.Testnet.ValidatorUpdates) > 0 {
-		validatorUpdates := map[string]map[string]int64{}
+		validatorUpdates := map[string]map[string]string{}
 		for height, validators := range node.Testnet.ValidatorUpdates {
-			updateVals := map[string]int64{}
-			for node, power := range validators {
-				updateVals[base64.StdEncoding.EncodeToString(node.PrivvalKey.PubKey().Bytes())] = power
+			updateVals := map[string]string{}
+			for node, pubkey := range validators {
+				updateVals[hex.EncodeToString(node.ProTxHash.Bytes())] = base64.StdEncoding.EncodeToString(pubkey.Bytes())
 			}
 			validatorUpdates[fmt.Sprintf("%v", height)] = updateVals
 		}
 		cfg["validator_update"] = validatorUpdates
+
+		thresholdPublicKeyUpdates := map[string]string{}
+		for height, thresholdPublicKey := range node.Testnet.ThresholdPublicKeyUpdates {
+
+			thresholdPublicKeyUpdates[fmt.Sprintf("%v", height)] = base64.StdEncoding.EncodeToString(thresholdPublicKey.Bytes())
+		}
+		cfg["threshold_public_key_update"] = thresholdPublicKeyUpdates
+
+		quorumHashUpdates := map[string]string{}
+		for height, quorumHash := range node.Testnet.QuorumHashUpdates {
+
+			quorumHashUpdates[fmt.Sprintf("%v", height)] = hex.EncodeToString(quorumHash.Bytes())
+		}
+		cfg["quorum_hash_update"] = quorumHashUpdates
+	}
+	if len(node.Testnet.ChainLockUpdates) > 0 {
+		chainLockUpdates := map[string]string{}
+		for height, coreHeight := range node.Testnet.ChainLockUpdates {
+			chainLockUpdates[fmt.Sprintf("%v", height)] = fmt.Sprintf("%v", coreHeight)
+		}
+		cfg["chainlock_updates"] = chainLockUpdates
 	}
 
 	var buf bytes.Buffer

@@ -82,7 +82,7 @@ func NewStore(db dbm.DB) Store {
 	return dbStore{db}
 }
 
-// LoadStateFromDBOrGenesisFile loads the most recent state from the database,
+// LoadFromDBOrGenesisFile loads the most recent state from the database,
 // or creates a new one from the given genesisFilePath.
 func (store dbStore) LoadFromDBOrGenesisFile(genesisFilePath string) (State, error) {
 	state, err := store.Load()
@@ -100,7 +100,7 @@ func (store dbStore) LoadFromDBOrGenesisFile(genesisFilePath string) (State, err
 	return state, nil
 }
 
-// LoadStateFromDBOrGenesisDoc loads the most recent state from the database,
+// LoadFromDBOrGenesisDoc loads the most recent state from the database,
 // or creates a new one from the given genesisDoc.
 func (store dbStore) LoadFromDBOrGenesisDoc(genesisDoc *types.GenesisDoc) (State, error) {
 	state, err := store.Load()
@@ -205,7 +205,8 @@ func (store dbStore) Bootstrap(state State) error {
 		return err
 	}
 
-	if err := store.saveConsensusParamsInfo(height, height, state.ConsensusParams); err != nil {
+	if err := store.saveConsensusParamsInfo(height,
+		state.LastHeightConsensusParamsChanged, state.ConsensusParams); err != nil {
 		return err
 	}
 
@@ -451,6 +452,7 @@ func (store dbStore) LoadValidators(height int64) (*types.ValidatorSet, error) {
 	if err != nil {
 		return nil, err
 	}
+	// fmt.Printf("loaded validators at %d %v", height, vip)
 
 	return vip, nil
 }
